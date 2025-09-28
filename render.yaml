@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: opensky-bbox-viewer
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: LAMIN
+        value: "35.5"
+      - key: LAMAX
+        value: "42.5"
+      - key: LOMIN
+        value: "25.5"
+      - key: LOMAX
+        value: "45.5"
+      - key: COUNTRY
+        value: "Turkey"
+      - key: OPEN_SKY_API
+        value: "https://opensky-network.org/api/states/all"
