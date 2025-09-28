@@ -1,20 +1,18 @@
 from flask import Flask, render_template_string, jsonify
-import requests
-import os
+import requests, os
 from collections import Counter
 from urllib.parse import urlencode
 
 app = Flask(__name__)
 
-# ----- Fixed bounding box (server side) -----
+# --- fixed server-side bbox ---
 DEFAULT_BBOX = {
-    "lamin": os.getenv("LAMIN", "35.5"),
-    "lamax": os.getenv("LAMAX", "42.5"),
-    "lomin": os.getenv("LOMIN", "25.5"),
-    "lomax": os.getenv("LOMAX", "45.5"),
+    "lamin": os.getenv("LAMIN", "35.9"),
+    "lamax": os.getenv("LAMAX", "42.1"),
+    "lomin": os.getenv("LOMIN", "25.9"),
+    "lomax": os.getenv("LOMAX", "45.1"),
 }
-OPEN_SKY_API = os.getenv("OPEN_SKY_API", "https://opensky-network.org/api/states/all")
-
+OPEN_SKY_API = "https://opensky-network.org/api/states/all"
 COLS = [
     "icao24","callsign","origin_country","time_position","last_contact",
     "longitude","latitude","baro_altitude","on_ground","velocity",
@@ -27,137 +25,124 @@ HTML = """
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>OpenSky — Israeli Flights over Turkish Airspace now</title>
+<title>Israeli Aircraft Tracker</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  :root { --muted:#6b7280; --bar:#6366f1; --b:#e5e7eb; }
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
-  header { display:flex; gap:12px; align-items:baseline; flex-wrap:wrap; }
-  .muted { color:var(--muted); font-size:12px; }
-  #btnRefresh[disabled] { opacity:.6; cursor:not-allowed; }
-  .error { background:#fee2e2; color:#7f1d1d; padding:10px; border-radius:8px; margin-top:10px; }
-
-  .counts { display:grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap:10px; margin:16px 0; }
-  .count-card { border:1px solid var(--b); border-radius:10px; padding:10px; }
-  .pill { background:#eef2ff; padding:6px 8px; border-radius:999px; font-size:12px; display:inline-block; }
-  .bar { height:6px; background:var(--bar); border-radius:4px; margin-top:6px; }
-  .israel .pill { background:#ffe4e6; font-weight:700; color:#b91c1c; }
-  .israel .bar { background:#b91c1c; }
-
-  table { border-collapse: collapse; width: 100%; margin-top: 16px; }
-  th, td { border: 1px solid var(--b); padding: 8px 10px; font-size: 13px; }
-  th { background: #f3f4f6; text-align: left; position: sticky; top: 0; z-index: 1; }
+ body {font-family:system-ui, sans-serif; margin:0; padding:0;}
+ header {padding:12px 20px; display:flex; gap:12px; align-items:center; background:#f3f4f6;}
+ h1 {margin:0; font-size:20px;}
+ #btnRefresh[disabled]{opacity:.6;cursor:not-allowed;}
+ #map {height:60vh; width:100%;}
+ .counts{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;padding:10px;}
+ .count-card{border:1px solid #ddd;border-radius:10px;padding:8px;}
+ .pill{background:#eef2ff;padding:4px 8px;border-radius:999px;font-size:12px;display:inline-block;}
+ .israel .pill{background:#ffe4e6;font-weight:700;color:#b91c1c;}
+ table{border-collapse:collapse;width:100%;margin:10px;}
+ th,td{border:1px solid #e5e7eb;padding:6px 8px;font-size:13px;}
+ th{background:#f3f4f6;}
 </style>
 </head>
 <body>
-  <header>
-    <h1>OpenSky Results — Israel flights</h1>
-    <a id="apiLink" class="muted" href="{{ bbox_url }}" target="_blank" rel="noreferrer">API request ↗</a>
-    <button id="btnRefresh" type="button">Refresh</button>
-  </header>
+<header>
+  <h1>Israeli Aircraft Over Turkey</h1>
+  <button id="btnRefresh">Refresh</button>
+</header>
 
-  {% if error %}
-    <div class="error">Error fetching data: {{ error }}</div>
-  {% endif %}
+<div id="map"></div>
 
-  <div class="muted">Table shows only flights with origin_country = <b>Israel</b>.</div>
+<h3 style="margin:10px;">Counts by origin_country</h3>
+<div id="counts" class="counts">
+  {% set maxc = (country_counts[0][1] if country_counts else 1) %}
+  {% for c,n in country_counts %}
+    <div class="count-card {% if c=='Israel' %}israel{% endif %}">
+      <div class="pill">{{c or "Unknown"}}</div>
+      <div>{{n}} flights</div>
+    </div>
+  {% endfor %}
+</div>
 
-  <h3 style="margin-top:20px;">Counts by origin_country</h3>
-  <div id="counts" class="counts">
-    {% set maxc = (country_counts[0][1] if country_counts else 1) %}
-    {% for c, n in country_counts %}
-      <div class="count-card {% if c == 'Israel' %}israel{% endif %}">
-        <div class="pill">{{ c or "Unknown" }}</div>
-        <div class="muted">{{ n }} flights</div>
-        <div class="bar" style="width: {{ (n/maxc)*100 }}%"></div>
-      </div>
-    {% endfor %}
-  </div>
-
-  <h3 id="tableHeading">Flights from Israel — <span id="rowCount">{{ rows|length }}</span> flights</h3>
-  <table id="dataTable">
-    <thead>
-      <tr>
-        <th>icao24</th><th>callsign</th><th>origin_country</th>
-        <th>longitude</th><th>latitude</th><th>geo_altitude</th>
-        <th>velocity</th><th>true_track</th><th>on_ground</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for s in rows %}
-      <tr class="israel">
-        <td>{{ s[0] }}</td>
-        <td>{{ s[1] }}</td>
-        <td>{{ s[2] }}</td>
-        <td>{{ s[5] }}</td>
-        <td>{{ s[6] }}</td>
-        <td>{{ s[13] }}</td>
-        <td>{{ s[9] }}</td>
-        <td>{{ s[10] }}</td>
-        <td>{{ s[8] }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+<h3 style="margin:10px;">Israeli flights — <span id="rowCount">{{rows|length}}</span></h3>
+<table id="dataTable">
+<thead>
+<tr>
+ <th>icao24</th><th>callsign</th><th>longitude</th><th>latitude</th>
+ <th>geo_altitude</th><th>velocity</th><th>true_track</th>
+</tr>
+</thead>
+<tbody>
+{% for s in rows %}
+<tr>
+ <td>{{s[0]}}</td><td>{{s[1]}}</td><td>{{s[5]}}</td><td>{{s[6]}}</td>
+ <td>{{s[13]}}</td><td>{{s[9]}}</td><td>{{s[10]}}</td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
 
 <script>
-async function refreshData() {
-  const btn = document.getElementById('btnRefresh');
-  btn.disabled = true;
-  const oldText = btn.textContent;
-  btn.textContent = 'Refreshing...';
+let map = L.map('map').setView([39,35],6);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  attribution:'&copy; OpenStreetMap contributors'
+}).addTo(map);
 
-  try {
-    const res = await fetch('/json', { cache: 'no-store' });
-    if (!res.ok) throw new Error('Request failed: ' + res.status);
-    const data = await res.json();
+let markersLayer = L.layerGroup().addTo(map);
 
-    // Update counts
-    const countsDiv = document.getElementById('counts');
-    countsDiv.innerHTML = '';
-    const maxc = data.counts.length ? data.counts[0][1] : 1;
-    for (const [name, cnt] of data.counts) {
-      const isIsrael = name === 'Israel';
-      const card = document.createElement('div');
-      card.className = 'count-card' + (isIsrael ? ' israel' : '');
-      card.innerHTML = `
-        <div class="pill">${name || 'Unknown'}</div>
-        <div class="muted">${cnt} flights</div>
-        <div class="bar" style="width:${(cnt / maxc) * 100}%"></div>`;
-      countsDiv.appendChild(card);
+function updateMap(rows){
+  markersLayer.clearLayers();
+  if(!rows.length) return;
+  let bounds = [];
+  rows.forEach(r=>{
+    if(r[5] && r[6]){
+      const m = L.marker([r[6], r[5]], {
+        icon: L.icon({
+          iconUrl:'https://cdn-icons-png.flaticon.com/512/67/67902.png',
+          iconSize:[24,24]
+        })
+      }).bindPopup(`<b>${r[1]||''}</b><br>Alt: ${r[13]||'?' } m<br>Vel: ${r[9]||'?'} m/s`);
+      m.addTo(markersLayer);
+      bounds.push([r[6], r[5]]);
     }
-
-    // Update table (Israel only)
-    const tb = document.querySelector('#dataTable tbody');
-    tb.innerHTML = '';
-    for (const s of data.rows) {
-      const tr = document.createElement('tr');
-      tr.className = 'israel';
-      tr.innerHTML = `
-        <td>${s[0] ?? ''}</td>
-        <td>${s[1] ?? ''}</td>
-        <td>${s[2] ?? ''}</td>
-        <td>${s[5] ?? ''}</td>
-        <td>${s[6] ?? ''}</td>
-        <td>${s[13] ?? ''}</td>
-        <td>${s[9] ?? ''}</td>
-        <td>${s[10] ?? ''}</td>
-        <td>${s[8] ?? ''}</td>`;
-      tb.appendChild(tr);
-    }
-
-    document.getElementById('rowCount').textContent = data.rows.length;
-    document.getElementById('apiLink').href = data.bbox_url;
-
-  } catch (e) {
-    alert('Refresh failed: ' + e.message);
-  } finally {
-    btn.textContent = oldText;
-    btn.disabled = false;
-  }
+  });
+  if(bounds.length) map.fitBounds(bounds, {padding:[20,20]});
 }
 
-document.getElementById('btnRefresh').addEventListener('click', refreshData);
+async function refresh(){
+  const btn=document.getElementById('btnRefresh');
+  btn.disabled=true; btn.textContent='Refreshing...';
+  try{
+    const r=await fetch('/json',{cache:'no-store'});
+    const d=await r.json();
+    document.getElementById('rowCount').textContent=d.rows.length;
+
+    // counts
+    const cdiv=document.getElementById('counts');
+    cdiv.innerHTML='';
+    d.counts.forEach(([name,cnt])=>{
+      const card=document.createElement('div');
+      card.className='count-card'+(name==='Israel'?' israel':'');
+      card.innerHTML=`<div class="pill">${name||'Unknown'}</div><div>${cnt} flights</div>`;
+      cdiv.appendChild(card);
+    });
+
+    // table
+    const tb=document.querySelector('#dataTable tbody');
+    tb.innerHTML='';
+    d.rows.forEach(r=>{
+      const tr=document.createElement('tr');
+      tr.innerHTML=`<td>${r[0]||''}</td><td>${r[1]||''}</td><td>${r[5]||''}</td><td>${r[6]||''}</td>
+                    <td>${r[13]||''}</td><td>${r[9]||''}</td><td>${r[10]||''}</td>`;
+      tb.appendChild(tr);
+    });
+
+    updateMap(d.rows);
+  }catch(e){alert(e);}
+  btn.disabled=false; btn.textContent='Refresh';
+}
+
+document.getElementById('btnRefresh').addEventListener('click',refresh);
+updateMap({{ rows|tojson }});
 </script>
 </body>
 </html>
@@ -171,47 +156,28 @@ def _fetch_states():
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     data = r.json()
-    if "states" not in data or data["states"] is None:
-        return url, []
-    return url, data["states"]
+    return url, data.get("states") or []
 
 @app.route("/")
 def index():
-    error = None
     try:
         bbox_url, states = _fetch_states()
     except Exception as e:
-        error = str(e)
-        bbox_url, states = _build_bbox_url(), []
-
+        return f"<h1>Error: {e}</h1>"
     counts = Counter([s[2] for s in states if s and len(s) >= len(COLS)])
-    counts_sorted = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
-
-    # Filter only Israel flights
-    rows = [s for s in states if s and len(s) >= len(COLS) and s[2] == "Israel"]
-
-    return render_template_string(
-        HTML,
-        error=error,
-        bbox_url=bbox_url,
-        country_counts=counts_sorted,
-        rows=rows
-    )
+    rows  = [s for s in states if s and len(s) >= len(COLS) and s[2]=="Israel"]
+    return render_template_string(HTML, bbox_url=bbox_url,
+                                  country_counts=sorted(counts.items(), key=lambda x:x[1], reverse=True),
+                                  rows=rows)
 
 @app.route("/json")
 def json_data():
-    try:
-        bbox_url, states = _fetch_states()
-        counts = Counter([s[2] for s in states if s and len(s) >= len(COLS)])
-        counts_sorted = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
-        rows = [s for s in states if s and len(s) >= len(COLS) and s[2] == "Israel"]
-        return jsonify({
-            "bbox_url": bbox_url,
-            "counts": counts_sorted,
-            "rows": rows,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
+    bbox_url, states = _fetch_states()
+    counts = Counter([s[2] for s in states if s and len(s) >= len(COLS)])
+    rows  = [s for s in states if s and len(s) >= len(COLS) and s[2]=="Israel"]
+    return jsonify({"bbox_url":bbox_url,
+                    "counts":sorted(counts.items(), key=lambda x:x[1], reverse=True),
+                    "rows":rows})
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
